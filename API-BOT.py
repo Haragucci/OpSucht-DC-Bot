@@ -25,8 +25,8 @@ intents.members = True
 
 bot = commands.AutoShardedBot(command_prefix='!', intents=intents)
 
-categories_cache = None
 items_cache = {}
+categories_cache = None
 
 API_URL = 'https://api.opsucht.net'
 
@@ -47,6 +47,11 @@ async def on_ready():
     guild = discord.Object(id=int(GUILD_ID))
     bot.tree.copy_global_to(guild=guild)
     try:
+        await get_all_items()
+        print('Hat geklappt')
+    except Exception as e:
+        print(e)
+    try:
         await bot.tree.sync()
         print('Globale Synchronisierung der Slash-Befehle abgeschlossen.')
     except Exception as e:
@@ -57,28 +62,6 @@ def get_item_image_url(item_name):
     base_url = "https://mc.nerothe.com/img/1.21/"
     formatted_item_name = f"minecraft_{item_name.lower()}"
     return f"{base_url}{formatted_item_name}.png"
-
-
-@bot.tree.command(name='list_commands', description='Listet alle Slash-Befehle auf')
-async def list_commands(interaction: Interaction):
-    try:
-        url = f'https://discord.com/api/v10/applications/{CLIENT_ID}/commands'
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers={'Authorization': f'Bot {TOKEN}'}) as response:
-                commands_data = await response.json()
-
-                if not commands_data:
-                    await interaction.response.send_message("Keine Slash-Befehle gefunden.")
-                else:
-                    commands_list = [f"/{cmd['name']}: {cmd['description']}" for cmd in commands_data]
-                    commands_message = "\n".join(commands_list)
-                    await interaction.response.send_message(f"Liste der Slash-Befehle:\n{commands_message}")
-    except aiohttp.ClientError as e:
-        print(f'Fehler beim Abrufen der Befehle: {e}')
-        await interaction.response.send_message('Fehler beim Abrufen der Befehle.')
-    except Exception as e:
-        print(f'Unerwarteter Fehler: {e}')
-        await interaction.response.send_message('Ein unerwarteter Fehler ist aufgetreten.')
 
 
 async def get_items(category=None):
@@ -113,31 +96,37 @@ async def get_items(category=None):
 
 async def get_items2(category=None):
     async with aiohttp.ClientSession() as session:
-        if category:
-            url = f'{API_URL}/market/prices'
-        else:
-            url = f'{API_URL}/market/items'
-
+        url = f'{API_URL}/market/prices'
         async with session.get(url, headers=headers) as response:
             text = await response.text()
             try:
                 data = json.loads(text)
+
+                def find_item_recursive(data, item_name):
+                    for key, value in data.items():
+                        if isinstance(value, dict):
+                            result = find_item_recursive(value, item_name)
+                            if result:
+                                return result
+                        elif key == item_name:
+                            return value
+                    return None
+
                 if category:
                     if category in data:
                         items = data[category]
                         items_cache.update(
                             {item: {'category': category, 'orders': orders} for item, orders in items.items()}
                         )
-                        return {item: {'category': category} for item in items}
+                        return {item: {'category': category, 'orders': orders} for item, orders in items.items()}
                     else:
                         return {}
                 else:
                     all_items = {}
-                    for cat, cat_items in data.items():
-                        if not isinstance(cat_items, dict):
-                            continue
-                        for item, orders in cat_items.items():
-                            all_items[item] = {'category': cat, 'orders': orders}
+                    for main_category, items in data.items():
+                        for item_name, orders in items.items():
+                            all_items[item_name] = {'category': main_category, 'orders': orders}
+                    items_cache.update(all_items)
                     return all_items
 
             except json.JSONDecodeError as e:
@@ -150,11 +139,17 @@ async def get_all_items():
     if not items_cache:
         all_items = {}
         categories = await get_categories()
+
         for category in categories:
-            items = await get_items2(category)
-            if items:
-                if isinstance(items, dict):
-                    all_items.update(items)
+            category_name = category.get('name')
+            if not category_name:
+                continue
+
+            items = await get_items2(category_name)
+            if items and isinstance(items, dict):
+                valid_items = {item: details for item, details in items.items() if isinstance(item, str)}
+                all_items.update(valid_items)
+
         items_cache = all_items
     return items_cache
 
@@ -177,7 +172,7 @@ async def get_categories():
     return categories_cache
 
 
-def create_category_embed(category, items):
+async def create_category_embed(category, items):
     pages = []
     page_size = 10
     emoji_buy = '💰'
@@ -204,7 +199,7 @@ def create_category_embed(category, items):
 
             embed.add_field(
                 name=f"{formatted_item_name}",
-                value=f"{buy_price} | {sell_price}",
+                value=f"{buy_price}\n{sell_price}",
                 inline=True
             )
 
@@ -264,7 +259,9 @@ async def abfrage(interaction: discord.Interaction, kategorie: str, item: str = 
             await interaction.followup.send("Keine Kategorien verfügbar. Bitte versuche es später erneut.")
             return
 
-        if kategorie not in categories:
+        category_names = [cat['name'] for cat in categories]
+
+        if kategorie not in category_names:
             await interaction.followup.send(f"Kategorie '{kategorie}' nicht gefunden.")
             return
 
@@ -283,7 +280,7 @@ async def abfrage(interaction: discord.Interaction, kategorie: str, item: str = 
             message = await interaction.followup.send(embed=embed)
         else:
             category_items = list(items.keys())
-            pages = create_category_embed(kategorie, category_items)
+            pages = await create_category_embed(kategorie, category_items)
             view = PaginationView(pages)
             message = await interaction.followup.send(embed=pages[0], view=view)
 
@@ -298,7 +295,6 @@ async def abfrage(interaction: discord.Interaction, kategorie: str, item: str = 
         await interaction.followup.send('Fehler beim Abrufen der Daten vom Server.')
     except Exception as e:
         print(f'Unerwarteter Fehler: {e}')
-        await interaction.followup.send('Ein unerwarteter Fehler ist aufgetreten.')
 
 
 @bot.tree.command(name='markt-item', description='Zeigt Details zu einem bestimmten Item')
@@ -307,7 +303,7 @@ async def abfrage_item(interaction: discord.Interaction, dein_item: str):
     try:
         await interaction.response.defer()
 
-        items = await get_items2()
+        items = await get_all_items()
 
         if dein_item not in items:
             await interaction.followup.send(f"Item '{dein_item}' nicht gefunden.")
@@ -330,11 +326,9 @@ async def abfrage_item(interaction: discord.Interaction, dein_item: str):
         await interaction.followup.send('Fehler beim Abrufen der Daten vom Server.')
     except Exception as e:
         print(f'Unerwarteter Fehler: {e}')
-        await interaction.followup.send('Ein unerwarteter Fehler ist aufgetreten.')
 
 
 def create_item_embed(item_name, orders, category):
-    print(f"Creating embed for item: {item_name}, orders: {orders}, category: {category}")
     emoji_buy = '💰'
     emoji_sell = '🏷️'
 
@@ -384,33 +378,6 @@ def create_item_embed(item_name, orders, category):
                 value="",
                 inline=True
             )
-
-        if buy_order:
-            embed.add_field(
-                name="**Akt. KauAuf.**",
-                value=f"{buy_order['activeOrders']}",
-                inline=True
-            )
-        else:
-            embed.add_field(
-                name="**Akt. KauAuf.**",
-                value="Nicht verfügbar",
-                inline=True
-            )
-
-        if sell_order:
-            embed.add_field(
-                name="**Akt. VerAuf.**",
-                value=f"{sell_order['activeOrders']}",
-                inline=True
-            )
-        else:
-            embed.add_field(
-                name="**Akt. VerAuf.**",
-                value="N/A",
-                inline=True
-            )
-
     else:
         embed.add_field(
             name=f"**Preise**",
@@ -431,10 +398,14 @@ def create_item_embed(item_name, orders, category):
 async def kategorie_autocomplete(interaction: discord.Interaction, current: str):
     try:
         categories = await asyncio.wait_for(get_categories(), timeout=5.0)
+
         choices = [
-                      app_commands.Choice(name=category, value=category)
-                      for category in categories if current.lower() in category.lower()
+                      app_commands.Choice(name=category['name'], value=category['name'])
+                      for category in categories
+                      if
+                      isinstance(category, dict) and 'name' in category and current.lower() in category['name'].lower()
                   ][:25]
+
         await interaction.response.autocomplete(choices or [])
     except asyncio.TimeoutError:
         await interaction.response.autocomplete([])
@@ -443,6 +414,9 @@ async def kategorie_autocomplete(interaction: discord.Interaction, current: str)
             pass
         else:
             raise e
+    except Exception as e:
+        print(f"Unerwarteter Fehler bei Kategorie Autocompletion: {e}")
+        await interaction.response.autocomplete([])
 
 
 def translate_back(translated_item):
@@ -483,16 +457,16 @@ async def item_autocomplete2(interaction: discord.Interaction, current: str):
         if not isinstance(items, dict):
             items = {}
 
-        translated_items = {translations.get(item, item): item for item in items}
+        translated_items = {
+            translations.get(item_name, item_name): item_name
+            for item_name in items.keys() if isinstance(item_name, str)
+        }
 
         choices = [
                       app_commands.Choice(name=translated_item, value=original_item)
                       for translated_item, original_item in translated_items.items()
                       if current.lower() in translated_item.lower() or current.lower() in original_item.lower()
                   ][:25]
-
-        if choices is None:
-            choices = []
 
         await interaction.response.autocomplete(choices)
     except asyncio.TimeoutError:
@@ -508,7 +482,7 @@ async def item_autocomplete2(interaction: discord.Interaction, current: str):
         await interaction.response.autocomplete([])
 
 
-@bot.tree.command(name='help', description='Zeigt alle verfügbaren Befehle')
+@bot.tree.command(name='hilfe', description='Zeigt alle verfügbaren Befehle')
 async def help(interaction: Interaction):
     befehle = [cmd for cmd in bot.tree.get_commands()]
     embed = discord.Embed(title='Help', description='Alle verfügbaren Befehle:', color=0x00FF00)
@@ -532,129 +506,6 @@ async def info(interaction: Interaction):
     embed.timestamp = discord.utils.utcnow()
 
     await interaction.response.send_message(embed=embed, delete_after=15)
-
-
-@bot.tree.command(name='clear', description='Löscht den Chat im aktuellen Kanal.')
-@app_commands.checks.has_permissions(manage_messages=True)
-async def clear_chat(interaction: discord.Interaction):
-    if not interaction.user.bot:
-        await interaction.response.defer(ephemeral=True)
-        await interaction.channel.purge(limit=100)
-        followup_message = await interaction.followup.send('Chat wurde gelöscht.', ephemeral=True)
-        await followup_message.delete(delay=5)
-    else:
-        await interaction.response.send_message('Du hast nicht die Berechtigung, diesen Befehl auszuführen.',
-                                                ephemeral=True)
-
-
-@bot.tree.command(name='kick', description='Kickt einen Benutzer vom Server')
-@app_commands.checks.has_permissions(kick_members=True)
-async def kick(interaction: Interaction, member: discord.Member, reason: str = None):
-    await member.kick(reason=reason)
-    await interaction.response.send_message(f'{member.mention} wurde vom Server gekickt. Grund: {reason}')
-
-
-@bot.tree.command(name='ban', description='Bannt einen Benutzer vom Server')
-@app_commands.checks.has_permissions(ban_members=True)
-async def ban(interaction: Interaction, user: discord.Member, grund: str = None):
-    await user.ban(reason=grund)
-    await interaction.response.send_message(f'{user.mention} wurde vom Server gebannt. Grund: {grund}')
-
-
-@bot.tree.command(name='unban', description='Entbannt einen Benutzer')
-@app_commands.checks.has_permissions(ban_members=True)
-async def unban(interaction: Interaction, user_id: str):
-    user = await bot.fetch_user(int(user_id))
-    await interaction.guild.unban(user)
-    await interaction.response.send_message(f'{user.mention} wurde entbannt.')
-
-
-@bot.tree.command(name='clearrole', description='Löscht alle rollen eines Users')
-async def clearrole(ctx, member: discord.Member):
-    await member.edit(roles=[])
-    await ctx.send(f'Die rollen des nutzers {member.name} wurden gelöscht.')
-    await ctx.message.delete()
-
-
-@bot.tree.command(name='nachricht', description='Lässt den Bot eine Nachricht in einem bestimmten Kanal senden')
-@app_commands.describe(
-    channel="Der Kanal, in dem die Nachricht gesendet werden soll",
-    nachricht="Die Nachricht, die gesendet werden soll"
-)
-async def nachricht(interaction: discord.Interaction, channel: discord.TextChannel, nachricht: str):
-    try:
-        if not channel.permissions_for(interaction.user).send_messages:
-            await interaction.response.send_message(
-                f"Du hast keine Berechtigung, Nachrichten in {channel.mention} zu senden.", ephemeral=True)
-            return
-
-        embed = discord.Embed(description=nachricht, color=0x00ff00)
-        embed.set_thumbnail(url=bot.user.avatar.url)
-        embed.set_footer(text=f"Nachricht ", icon_url=bot.user.avatar.url)
-        embed.timestamp = discord.utils.utcnow()
-
-        await channel.send(embed=embed)
-
-        try:
-            await interaction.response.send_message(f"Nachricht wurde erfolgreich in {channel.mention} gesendet.",
-                                                    ephemeral=True)
-        except discord.NotFound:
-            pass
-
-    except discord.Forbidden:
-        await interaction.response.send_message("Ich habe keine Berechtigung, Nachrichten in diesem Kanal zu senden.",
-                                                ephemeral=True)
-    except discord.HTTPException:
-        await interaction.response.send_message("Es gab einen Fehler beim Senden der Nachricht.", ephemeral=True)
-
-
-@bot.tree.command(name='umfrage', description='Erstellt eine stylische Umfrage mit zwei Optionen')
-async def poll(interaction: Interaction, frage: str, option1: str, option2: str, mehrfachauswahl: bool):
-    await interaction.response.send_message('🎉 Die Umfrage wird erstellt... 🗳️', ephemeral=True)
-
-    multiple_choice_text = " ✅ Ja" if mehrfachauswahl else " ❌ Nein"
-
-    embed = discord.Embed(
-        title="📊 **Umfrage**",
-        description=f"**{frage}**\n\nMerfach Antwort möglich: {multiple_choice_text}",
-        color=discord.Color.from_rgb(47, 49, 54)
-    )
-
-    embed.add_field(
-        name="🔵 **Option 1**",
-        value=option1,
-        inline=True
-    )
-    embed.add_field(
-        name="\n\n🟢 **Option 2**",
-        value=option2,
-        inline=True
-    )
-
-    embed.set_footer(
-        text="⬇️ Wähle durch Anklicken der Reaktionen unten! ⬇️",
-        icon_url=bot.user.avatar.url
-    )
-    embed.timestamp = discord.utils.utcnow() + timedelta(hours=2)
-
-    message = await interaction.channel.send(embed=embed)
-    await message.add_reaction('🔵')
-    await message.add_reaction('🟢')
-
-    def check(reaction, user):
-        return user != bot.user and reaction.message.id == message.id and reaction.emoji in ['🔵', '🟢']
-
-    while True:
-        try:
-            reaction, user = await bot.wait_for('reaction_add', check=check)
-            if not mehrfachauswahl:
-                if reaction.emoji == '🔵':
-                    await message.remove_reaction('🟢', user)
-                elif reaction.emoji == '🟢':
-                    await message.remove_reaction('🔵', user)
-        except asyncio.TimeoutError:
-            break
-
 
 @bot.tree.command(name='test', description='Führt einen Test aus im Channel')
 async def test(ctx):
